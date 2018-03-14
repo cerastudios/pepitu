@@ -1,103 +1,130 @@
 <?php
-/*
- * Author - Rob Thomson <rob@marotori.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- */
 
+define('PROXY_START', microtime(true));
+
+require("vendor/autoload.php");
+
+use Proxy\Http\Request;
+use Proxy\Http\Response;
+use Proxy\Plugin\AbstractPlugin;
+use Proxy\Event\FilterEvent;
+use Proxy\Config;
+use Proxy\Proxy;
+
+// start the session
 session_start();
-ob_start();
 
-/* config settings */
-$base = "http://www.bbc.co.uk";  //set this to the url you want to scrape
-$ckfile = '/tmp/simpleproxy-cookie-'.session_id();  //this can be set to anywhere you fancy!  just make sure it is secure.
+// load config...
+Config::load('./config.php');
 
+// custom config file to be written to by a bash script or something
+Config::load('./custom_config.php');
 
-
-/* all system code happens below - you should not need to edit it! */
-
-//work out cookie domain
-$cookiedomain = str_replace("http://www.","",$base);
-$cookiedomain = str_replace("https://www.","",$cookiedomain);
-$cookiedomain = str_replace("www.","",$cookiedomain);
-
-$url = $base . $_SERVER['REQUEST_URI'];
-
-if($_SERVER['HTTPS'] == 'on'){
-	$mydomain = 'https://'.$_SERVER['HTTP_HOST'];
-} else {
-	$mydomain = 'http://'.$_SERVER['HTTP_HOST'];
+if(!Config::get('app_key')){
+	die("app_key inside config.php cannot be empty!");
 }
 
-// Open the cURL session
-$curlSession = curl_init();
-
-curl_setopt ($curlSession, CURLOPT_URL, $url);
-curl_setopt ($curlSession, CURLOPT_HEADER, 1);
-
-
-if($_SERVER['REQUEST_METHOD'] == 'POST'){
-	curl_setopt ($curlSession, CURLOPT_POST, 1);
-	curl_setopt ($curlSession, CURLOPT_POSTFIELDS, $_POST);
+if(!function_exists('curl_version')){
+	die("cURL extension is not loaded!");
 }
 
-curl_setopt($curlSession, CURLOPT_RETURNTRANSFER,1);
-curl_setopt($curlSession, CURLOPT_TIMEOUT,30);
-curl_setopt($curlSession, CURLOPT_SSL_VERIFYHOST, 1);
-curl_setopt ($curlSession, CURLOPT_COOKIEJAR, $ckfile); 
-curl_setopt ($curlSession, CURLOPT_COOKIEFILE, $ckfile);
-
-//handle other cookies cookies
-foreach($_COOKIE as $k=>$v){
-	if(is_array($v)){
-		$v = serialize($v);
-	}
-	curl_setopt($curlSession,CURLOPT_COOKIE,"$k=$v; domain=.$cookiedomain ; path=/");
+// how are our URLs be generated from this point? this must be set here so the proxify_url function below can make use of it
+if(Config::get('url_mode') == 2){
+	Config::set('encryption_key', md5(Config::get('app_key').$_SERVER['REMOTE_ADDR']));
+} else if(Config::get('url_mode') == 3){
+	Config::set('encryption_key', md5(Config::get('app_key').session_id()));
 }
 
-//Send the request and store the result in an array
-$response = curl_exec ($curlSession);
+// very important!!! otherwise requests are queued while waiting for session file to be unlocked
+session_write_close();
 
-// Check that a connection was made
-if (curl_error($curlSession)){
-        // If it wasn't...
-        print curl_error($curlSession);
-} else {
+// form submit in progress...
+if(isset($_POST['url'])){
+	
+	$url = $_POST['url'];
+	$url = add_http($url);
+	
+	header("HTTP/1.1 302 Found");
+	header('Location: '.proxify_url($url));
+	exit;
+	
+} else if(!isset($_GET['q'])){
 
-	//clean duplicate header that seems to appear on fastcgi with output buffer on some servers!!
-	$response = str_replace("HTTP/1.1 100 Continue\r\n\r\n","",$response);
-
-	$ar = explode("\r\n\r\n", $response, 2); 
-
-
-	$header = $ar[0];
-	$body = $ar[1];
-
-	//handle headers - simply re-outputing them
-	$header_ar = split(chr(10),$header); 
-	foreach($header_ar as $k=>$v){
-		if(!preg_match("/^Transfer-Encoding/",$v)){
-			$v = str_replace($base,$mydomain,$v); //header rewrite if needed
-			header(trim($v));
-		}
+	// must be at homepage - should we redirect somewhere else?
+	if(Config::get('index_redirect')){
+		
+		// redirect to...
+		header("HTTP/1.1 302 Found"); 
+		header("Location: ".Config::get('index_redirect'));
+		
+	} else {
+		echo render_template("./templates/main.php", array('version' => Proxy::VERSION));
 	}
 
-  //rewrite all hard coded urls to ensure the links still work!
-	$body = str_replace($base,$mydomain,$body);
-
-	print $body;
-
+	exit;
 }
 
-curl_close ($curlSession);
+// decode q parameter to get the real URL
+$url = url_decrypt($_GET['q']);
 
+$proxy = new Proxy();
+
+// load plugins
+foreach(Config::get('plugins', array()) as $plugin){
+
+	$plugin_class = $plugin.'Plugin';
+	
+	if(file_exists('./plugins/'.$plugin_class.'.php')){
+	
+		// use user plugin from /plugins/
+		require_once('./plugins/'.$plugin_class.'.php');
+		
+	} else if(class_exists('\\Proxy\\Plugin\\'.$plugin_class)){
+	
+		// does the native plugin from php-proxy package with such name exist?
+		$plugin_class = '\\Proxy\\Plugin\\'.$plugin_class;
+	}
+	
+	// otherwise plugin_class better be loaded already through composer.json and match namespace exactly \\Vendor\\Plugin\\SuperPlugin
+	$proxy->getEventDispatcher()->addSubscriber(new $plugin_class());
+}
+
+try {
+
+	// request sent to index.php
+	$request = Request::createFromGlobals();
+	
+	// remove all GET parameters such as ?q=
+	$request->get->clear();
+	
+	// forward it to some other URL
+	$response = $proxy->forward($request, $url);
+	
+	// if that was a streaming response, then everything was already sent and script will be killed before it even reaches this line
+	$response->send();
+	
+} catch (Exception $ex){
+
+	// if the site is on server2.proxy.com then you may wish to redirect it back to proxy.com
+	if(Config::get("error_redirect")){
+	
+		$url = render_string(Config::get("error_redirect"), array(
+			'error_msg' => rawurlencode($ex->getMessage())
+		));
+		
+		// Cannot modify header information - headers already sent
+		header("HTTP/1.1 302 Found");
+		header("Location: {$url}");
+		
+	} else {
+	
+		echo render_template("./templates/main.php", array(
+			'url' => $url,
+			'error_msg' => $ex->getMessage(),
+			'version' => Proxy::VERSION
+		));
+		
+	}
+}
 
 ?>
